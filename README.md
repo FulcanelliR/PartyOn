@@ -6,5 +6,5 @@ Keep in mind there are a lot of different parties out there:
   1) House Party
   2) Pool Party
   3) Birthday Party
-  4) Raiding Party...:D
+  4) Raiding Party...  :D
 Enjoy Responsibly and Only use for authorized testing. Carry on to the boats!
